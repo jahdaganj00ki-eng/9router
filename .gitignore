@@ -21,6 +21,7 @@ cli/.build-home/
 product
 # production
 /build
+/.build/
 .idea/
 
 # misc
@@ -61,6 +62,8 @@ Thanks.md
 PUBLIC.en.md
 PR/*
 package-lock.json
+!/package-lock.json
+!/electron/package-lock.json
 
 
 #Ignore vscode AI rules

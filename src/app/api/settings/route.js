@@ -3,6 +3,9 @@ import { getSettings, updateSettings } from "@/lib/localDb";
 import { applyOutboundProxyEnv } from "@/lib/network/outboundProxy";
 import { resetComboRotation } from "open-sse/services/combo.js";
 import bcrypt from "bcryptjs";
+import fs from "node:fs";
+import path from "node:path";
+import { DATA_DIR } from "@/lib/dataDir";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -58,8 +61,9 @@ export async function PATCH(request) {
         }
       } else {
         // First time setting password, no current password needed
-        // Allow empty currentPassword or default "123456"
-        if (body.currentPassword && body.currentPassword !== "123456") {
+        // Allow an empty current password or the configured initial password.
+        const initialPassword = process.env.INITIAL_PASSWORD || "123456";
+        if (body.currentPassword && body.currentPassword !== initialPassword) {
            return NextResponse.json({ error: "Invalid current password" }, { status: 401 });
         }
       }
@@ -77,6 +81,13 @@ export async function PATCH(request) {
     }
 
     const settings = await updateSettings(body);
+    if (body.password && process.env.NINEROUTER_DESKTOP === "1") {
+      try {
+        fs.rmSync(path.join(DATA_DIR, "desktop-initial-password"), { force: true });
+      } catch {
+        // Password persistence succeeded; cleanup is best effort.
+      }
+    }
 
     // Apply outbound proxy settings immediately (no restart required)
     if (

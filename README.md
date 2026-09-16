@@ -119,6 +119,16 @@ Default URLs:
 - Dashboard: `http://localhost:20128/dashboard`
 - OpenAI-compatible API: `http://localhost:20128/v1`
 
+### Windows Desktop Build
+
+Windows installers are built exclusively by GitHub Actions from a version tag:
+
+```text
+v<major>.<minor>.<patch> → 9Router.Setup.<version>.exe
+```
+
+The desktop build runs the server locally on `127.0.0.1:20128`, stores data in `%APPDATA%\\9router`, and uses `/api/health` as its readiness endpoint. Release 1 intentionally has no runtime npm installation, MITM auto-start, or automatic updater. Installer and portable artifacts are published on the GitHub Release after the packaged Windows smoke test passes.
+
 ---
 
 ## Video Guides

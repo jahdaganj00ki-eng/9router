@@ -1,0 +1,209 @@
+name: Windows Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing release tag, for example v0.5.76"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22.14.0"
+  CI_JWT_SECRET: "ci-build-secret-with-sufficient-length-for-validation"
+  CI_PORT: "20128"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: resolve
+        name: Resolve immutable release tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then VERSION="$REF_NAME"; else VERSION="$INPUT_VERSION"; fi
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            SHA="$PUSH_SHA"
+          else
+            git ls-remote --exit-code origin "refs/tags/$VERSION" >/dev/null || { echo "Tag not found: $VERSION" >&2; exit 1; }
+            git fetch --quiet origin "refs/tags/$VERSION:refs/tags/$VERSION"
+            SHA="$(git rev-parse "$VERSION^{commit}")"
+          fi
+          [[ -n "$SHA" ]] || { echo "Tag not found: $VERSION" >&2; exit 1; }
+          echo "source_ref=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify versions and source
+        env:
+          EXPECTED_SHA: ${{ steps.resolve.outputs.source_sha }}
+          EXPECTED_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const root = JSON.parse(fs.readFileSync('package.json'));
+          const cli = JSON.parse(fs.readFileSync('cli/package.json'));
+          const expected = process.env.EXPECTED_VERSION;
+          if (root.version !== expected || cli.version !== expected) {
+            throw new Error(`Version mismatch: root=${root.version}, cli=${cli.version}, tag=${expected}`);
+          }
+          NODE
+
+  quality:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Require lockfiles
+        run: test -f package-lock.json && test -f electron/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx eslint .
+        env:
+          JWT_SECRET: ${{ env.CI_JWT_SECRET }}
+      - run: npm run build
+        env:
+          JWT_SECRET: ${{ env.CI_JWT_SECRET }}
+          NEXT_PUBLIC_BASE_URL: http://127.0.0.1:${{ env.CI_PORT }}
+          PORT: ${{ env.CI_PORT }}
+
+  package-windows:
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Require lockfiles
+        shell: pwsh
+        run: |
+          if (!(Test-Path package-lock.json) -or !(Test-Path electron/package-lock.json)) { throw "Release lockfiles are missing" }
+      - name: Install root dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build server on Windows
+        run: npm run build
+        env:
+          JWT_SECRET: ${{ env.CI_JWT_SECRET }}
+          NEXT_PUBLIC_BASE_URL: http://127.0.0.1:${{ env.CI_PORT }}
+          PORT: ${{ env.CI_PORT }}
+          HOSTNAME: 127.0.0.1
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm ci --no-audit --no-fund
+      - name: Set desktop version
+        working-directory: electron
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $pkg = Get-Content package.json | ConvertFrom-Json
+          $pkg.version = $env:RELEASE_VERSION
+          $pkg | ConvertTo-Json -Depth 100 | Set-Content package.json
+      - name: Package Windows artifacts
+        working-directory: electron
+        run: npm run build:win
+      - name: Packaged smoke test
+        env:
+          ELECTRON_SMOKE_TIMEOUT_MS: "60000"
+        run: node scripts/smoke-electron-packaged.mjs
+      - name: Collect and hash exact artifacts
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          $dir = "release-assets"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $installer = "electron/dist-electron/9Router.Setup.$env:RELEASE_VERSION.exe"
+          $portable = "electron/dist-electron/9Router.$env:RELEASE_VERSION.portable.exe"
+          if (!(Test-Path $installer)) { throw "Missing $installer" }
+          if (!(Test-Path $portable)) { throw "Missing $portable" }
+          Copy-Item $installer "$dir/9Router.Setup.$env:RELEASE_VERSION.exe"
+          Copy-Item $portable "$dir/9Router.$env:RELEASE_VERSION.portable.exe"
+          @{ repository = "${{ github.repository }}"; tag = "v$env:RELEASE_VERSION"; commit = $env:SOURCE_SHA; version = $env:RELEASE_VERSION; platform = "win32"; arch = "x64"; mitm = "disabled"; updater = "disabled" } |
+            ConvertTo-Json | Set-Content "$dir/build-metadata.json"
+          Get-ChildItem $dir -File | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } |
+            Set-Content "$dir/SHA256SUMS.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-desktop-${{ needs.validate.outputs.version }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [validate, package-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-desktop-${{ needs.validate.outputs.version }}
+          path: release-assets
+      - name: Verify artifact contract
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4
+          test -f "release-assets/9Router.Setup.$VERSION.exe"
+          test -f "release-assets/9Router.$VERSION.portable.exe"
+          test -f release-assets/build-metadata.json
+          test -f release-assets/SHA256SUMS.txt
+          grep -q "$SHA" release-assets/build-metadata.json
+          (cd release-assets && sha256sum -c SHA256SUMS.txt)
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: 9Router v${{ needs.validate.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
